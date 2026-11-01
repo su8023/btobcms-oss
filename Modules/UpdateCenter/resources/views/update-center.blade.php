@@ -1,0 +1,105 @@
+<x-filament-panels::page>
+    {{-- 中断横幅：断点继续 / 放弃 --}}
+    @if($this->resumable())
+        <x-filament::section class="border-warning-500">
+            <x-slot:heading>⚠ 上次更新中断于「{{ $this->interruptedStep() }}」步骤（目标 {{ $this->interruptedTag() }}）</x-slot:heading>
+            <x-slot:description>站点当前处于维护模式（访客看到 503）。点顶部「继续更新」从断点恢复；若想暂时恢复访客访问，点「恢复访问并放弃」。</x-slot:description>
+        </x-filament::section>
+    @endif
+
+    {{-- 当前版本 vs 最新版本 --}}
+    <div class="mb-4 grid gap-4 md:grid-cols-3">
+        <x-filament::section>
+            <x-slot:heading>{{ __('admin.update_center.current_version') }}</x-slot:heading>
+            <p class="text-2xl font-bold">{{ $currentVersion }}</p>
+            <p class="text-xs text-gray-500 mt-1">{{ __('admin.update_center.git_na') }}</p>
+        </x-filament::section>
+
+        <x-filament::section>
+            <x-slot:heading>{{ __('admin.update_center.latest_version') }}</x-slot:heading>
+            @if($githubError !== '')
+                <p class="text-sm text-danger-600">{{ $githubError }}</p>
+            @elseif($latestTag !== null)
+                <p class="text-2xl font-bold {{ $this->hasUpdate() ? 'text-success-600' : '' }}">{{ $latestTag }}</p>
+                <p class="text-xs text-gray-500 mt-1">
+                    {{ $this->hasUpdate() ? __('admin.update_center.update_available') : __('admin.update_center.up_to_date') }}
+                </p>
+            @else
+                <p class="text-sm text-gray-500">{{ __('admin.update_center.no_releases') }}</p>
+            @endif
+        </x-filament::section>
+
+        <x-filament::section>
+            <x-slot:heading>{{ __('admin.update_center.repo') }}</x-slot:heading>
+            <p class="text-sm font-mono">{{ $repo ?: '—' }}</p>
+            <p class="text-xs text-gray-500 mt-1">
+                <a href="https://github.com/{{ $repo }}/releases" target="_blank" rel="noopener" class="text-primary-600 underline">
+                    {{ __('admin.update_center.view_on_github') }}
+                </a>
+            </p>
+        </x-filament::section>
+    </div>
+
+    {{-- 升级前置问题（缺 zip 扩展/目录不可写） --}}
+    @if($preflightProblems !== [])
+        <x-filament::section class="border-danger-500">
+            <x-slot:heading>{{ __('admin.update_center.preflight_problems') }}</x-slot:heading>
+            <ul class="list-disc pl-5 space-y-1">
+                @foreach($preflightProblems as $problem)
+                    <li class="text-sm">{{ $problem }}</li>
+                @endforeach
+            </ul>
+        </x-filament::section>
+    @endif
+
+    {{-- 最新版变更说明 --}}
+    @if($latestNotes !== '' && $latestNotes !== null)
+        <x-filament::section>
+            <x-slot:heading>{{ __('admin.update_center.changelog') }}（{{ $latestTag }}）</x-slot:heading>
+            {{-- 内联换行样式：Filament 预编译 CSS 不含 whitespace-pre-wrap 等工具类，
+                 长行（诊断日志里的 JSON 摘录）会横向溢出容器 --}}
+            <pre style="white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-all; max-height: 24rem; overflow-y: auto; padding: 1rem; border-radius: 0.5rem;">{{ $latestNotes }}</pre>
+        </x-filament::section>
+    @endif
+
+    {{-- 历史版本 --}}
+    @if($releases !== [])
+        <x-filament::section>
+            <x-slot:heading>{{ __('admin.update_center.history') }}</x-slot:heading>
+            <div class="space-y-2">
+                @foreach($releases as $release)
+                    <div class="flex items-center justify-between gap-3 rounded-lg border p-3">
+                        <div class="min-w-0">
+                            <p class="font-semibold text-sm">
+                                {{ $release['tag'] }}
+                                @if($release['prerelease'])
+                                    <span class="ml-1 text-xs text-warning-600">测试版</span>
+                                @endif
+                                @if($release['tag'] === $currentVersion)
+                                    <span class="ml-1 text-xs text-success-600">{{ __('admin.update_center.current_badge') }}</span>
+                                @endif
+                            </p>
+                            <p class="text-xs text-gray-500 truncate">{{ $release['name'] }} · {{ $release['date'] }}</p>
+                        </div>
+                        @if($release['tag'] !== $currentVersion)
+                            <x-filament::button
+                                size="xs"
+                                color="gray"
+                                wire:click="updateTo('{{ $release['tag'] }}')"
+                                wire:confirm="{{ __('admin.update_center.confirm_desc') }}"
+                            >
+                                {{ __('admin.update_center.update_to') }}
+                            </x-filament::button>
+                        @endif
+                    </div>
+                @endforeach
+            </div>
+        </x-filament::section>
+    @endif
+
+    {{-- 执行日志（队列进度实时轮询） --}}
+    <x-filament::section wire:poll.5s="logTail">
+        <x-slot:heading>{{ __('admin.update_center.log') }}</x-slot:heading>
+        <pre style="white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-all; max-height: 24rem; overflow-y: auto; padding: 1rem; border-radius: 0.5rem;" class="text-xs">{{ $this->logTail() ?: __('admin.update_center.log_empty') }}</pre>
+    </x-filament::section>
+</x-filament-panels::page>

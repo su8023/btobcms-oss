@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <!-- Workshop mark (favicon: solid for small sizes) -->
+  <path d="M32 4.8 56.2 18.8v28L32 60.8 7.8 46.8v-28L32 4.8Z" fill="#171b21"/>
+  <circle cx="32" cy="32.8" r="9" fill="#d95d18"/>
+</svg>

@@ -1,0 +1,193 @@
+<?php
+
+namespace Tests\Feature;
+
+use App\Models\User;
+use Illuminate\Foundation\Testing\RefreshDatabase;
+use Illuminate\Support\Facades\File;
+use Tests\TestCase;
+
+class InstallWizardTest extends TestCase
+{
+    use RefreshDatabase;
+
+    private string $envBackup = '';
+    private string $lockPath = '';
+    private string $testDb = '';
+
+    protected function setUp(): void
+    {
+        // 备份 .env 必须在 parent::setUp() 之前（app 容器尚未启动，用纯路径）：
+        // 若 RefreshDatabase 在 parent 内崩溃，空备份会被 tearDown 写回清空 .env
+        $this->envBackup = (string) file_get_contents(__DIR__.'/../../.env');
+
+        parent::setUp();
+
+        $this->lockPath = storage_path('app/installed.lock');
+        $this->testDb = storage_path('app/install-test.sqlite');
+
+        File::delete($this->lockPath);
+        File::delete($this->testDb);
+
+        // 模拟"全新安装"：安装向导的"已安装"判定有两条 ——
+        //   ① storage/app/installed.lock 存在
+        //   ② .env 里已配置非空 APP_KEY
+        // 第②条是防匿名重装的关键（storage/ 未持久化时锁文件会丢，
+        // 只靠锁文件的话向导会重新开放、被匿名改写 .env 并建出攻击者的管理员）。
+        // 因此测试必须把 .env 里的 APP_KEY 清空，否则站点会被判为"已安装"、向导直接 404。
+        // 放在 parent::setUp() 之后：应用已用真实密钥启动完毕，
+        // 清空文件里的这一行不影响本次请求的加解密。
+        $env = (string) file_get_contents(base_path('.env'));
+        $env = preg_replace('/^APP_KEY=.*$/m', 'APP_KEY=', $env) ?? $env;
+        File::put(base_path('.env'), $env);
+    }
+
+    protected function tearDown(): void
+    {
+        // 仅在拿到有效备份时还原（防 setUp 中途崩溃把空串写回清空 .env）
+        if (strlen($this->envBackup) > 10) {
+            File::put(base_path('.env'), $this->envBackup);
+        }
+        File::delete($this->lockPath);
+        File::delete($this->testDb);
+
+        // 清理安装器可能留下的运行时连接与配置缓存（config:cache 类命令会重载进程配置）
+        try {
+            $this->app['db']->purge('install_run');
+            $this->app['db']->purge('install_check');
+        } catch (\Throwable) {
+        }
+        File::delete(base_path('bootstrap/cache/config.php'));
+
+        parent::tearDown();
+    }
+
+    public function test_wizard_shows_environment_checks_when_not_installed(): void
+    {
+        $this->get('/install')
+            ->assertOk()
+            ->assertSee('环境检测')
+            ->assertSee('目录可写 storage')
+            ->assertSee('BtoBcms 安装向导', false);
+    }
+
+    public function test_full_install_flow_creates_env_admin_and_lock(): void
+    {
+        $response = $this->post('/install', [
+            'db_connection' => 'sqlite',
+            'db_database' => 'storage/app/install-test.sqlite',
+            'app_name' => 'Test Factory Supply',
+            'admin_name' => 'Boss',
+            'admin_email' => 'boss@example.com',
+            'admin_password' => 'Secret@12345',
+            // 带空格的 CDN 代理段：必须被归一化成逗号裸写（TrustProxies 按逗号 explode）
+            'trusted_proxies' => ' 173.245.48.0/20, 103.21.244.0/22 ',
+        ]);
+
+        $response->assertRedirect('/install/done');
+        $this->get('/install/done')->assertOk()->assertSee('安装完成');
+
+        // .env 生成且带关键生产配置；重复键会让 dotenv（不可变模式）取首值导致配置失效
+        $env = File::get(base_path('.env'));
+        $this->assertStringContainsString('APP_ENV=production', $env);
+        $this->assertStringContainsString('APP_DEBUG=false', $env);
+        $this->assertStringContainsString('APP_KEY=base64:', $env);
+        $this->assertStringContainsString('DB_CONNECTION=sqlite', $env);
+        $this->assertStringContainsString('APP_NAME="Test Factory Supply"', $env);
+        $this->assertStringContainsString('TRUSTED_PROXIES=173.245.48.0/20,103.21.244.0/22', $env);
+        $this->assertSame(1, preg_match_all('/^APP_KEY=/m', $env), 'APP_KEY 不得出现重复键');
+        $this->assertSame(1, preg_match_all('/^APP_NAME=/m', $env), 'APP_NAME 不得出现重复键');
+        $this->assertSame(1, preg_match_all('/^DB_DATABASE=/m', $env), 'DB_DATABASE 不得出现重复键');
+        $this->assertSame(1, preg_match_all('/^TRUSTED_PROXIES=/m', $env), 'TRUSTED_PROXIES 不得出现重复键');
+        $this->assertStringNotContainsString("APP_KEY=\n", $env, 'APP_KEY 不得为空值');
+
+        // 安装锁 + 管理员账号（写入独立 install_run 连接，断言同连接）
+        $this->assertFileExists($this->lockPath);
+        $lock = json_decode((string) File::get($this->lockPath), true);
+        $this->assertSame('done', $lock['status'] ?? null);
+        $this->assertArrayHasKey('optimize', $lock, '锁文件必须记录缓存生成状态');
+        $this->assertSame('admin', \DB::connection('install_run')->table('users')->where('email', 'boss@example.com')->value('role'), '安装向导创建的账号必须是 admin');
+
+        // 已安装后所有入口关闭
+        $this->get('/install')->assertNotFound();
+        $this->post('/install', [])->assertNotFound();
+        $this->get('/install/done')->assertOk(); // done 页保留作完成回看
+    }
+
+    public function test_omitted_trusted_proxies_writes_no_live_line(): void
+    {
+        $this->post('/install', [
+            'db_connection' => 'sqlite',
+            'db_database' => 'storage/app/install-test.sqlite',
+            'app_name' => 'X',
+            'admin_name' => 'Y',
+            'admin_email' => 'y2@example.com',
+            'admin_password' => 'Secret@12345',
+        ])->assertRedirect('/install/done');
+
+        // 未填写时不写活动行：.env.example 里的注释示例行（# TRUSTED_PROXIES=*）保留即可
+        $env = File::get(base_path('.env'));
+        $this->assertSame(0, preg_match_all('/^TRUSTED_PROXIES=/m', $env), '未填写时不得写入 TRUSTED_PROXIES 活动行');
+    }
+
+    public function test_rejects_invalid_trusted_proxies(): void
+    {
+        $this->from('/install')->post('/install', [
+            'db_connection' => 'sqlite',
+            'db_database' => 'storage/app/install-test.sqlite',
+            'app_name' => 'X',
+            'admin_name' => 'Y',
+            'admin_email' => 'y3@example.com',
+            'admin_password' => 'Secret@12345',
+            'trusted_proxies' => 'evil $(rm -rf) value',
+        ])->assertSessionHasErrors('trusted_proxies');
+
+        $this->assertFileDoesNotExist($this->lockPath);
+    }
+
+    public function test_rejects_non_empty_database(): void
+    {
+        // 预置一个非空 sqlite 文件
+        File::put($this->testDb, 'not empty');
+
+        $this->from('/install')->post('/install', [
+            'db_connection' => 'sqlite',
+            'db_database' => 'storage/app/install-test.sqlite',
+            'app_name' => 'X',
+            'admin_name' => 'Y',
+            'admin_email' => 'y@example.com',
+            'admin_password' => 'Secret@12345',
+        ])->assertSessionHasErrors('db_database');
+
+        $this->assertFileDoesNotExist($this->lockPath);
+    }
+
+    public function test_validates_required_fields(): void
+    {
+        $this->from('/install')->post('/install', [
+            'db_connection' => 'mysql',
+            'db_database' => '',
+        ])->assertSessionHasErrors(['db_database', 'db_host', 'db_username', 'app_name', 'admin_email', 'admin_password']);
+    }
+
+    public function test_env_quotes_special_char_credentials(): void
+    {
+        // 宝塔随机密码常见杀手字符：# 空格 $ 引号 反斜杠——裸写进 .env 会被
+        // dotenv 当注释截断或解析报错，装完即数据库连不上
+        $password = 'p@ss #1 $"x" \\end';
+
+        $this->post('/install', [
+            'db_connection' => 'sqlite',
+            'db_database' => 'storage/app/install-test.sqlite',
+            'db_password' => $password,
+            'app_name' => 'X "Quoted" Co',
+            'admin_name' => 'Boss',
+            'admin_email' => 'boss2@example.com',
+            'admin_password' => 'Secret@12345',
+        ])->assertRedirect('/install/done');
+
+        $parsed = \Dotenv\Dotenv::parse(File::get(base_path('.env')));
+        $this->assertSame($password, $parsed['DB_PASSWORD'] ?? null, '特殊字符密码必须无损写入 .env');
+        $this->assertSame('X "Quoted" Co', $parsed['APP_NAME'] ?? null, '含引号的站点名必须无损写入 .env');
+    }
+}

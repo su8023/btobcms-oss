@@ -1,0 +1,167 @@
+<?php
+
+namespace Modules\LeadMagnet\Http\Controllers;
+
+use App\Models\Inquiry;
+use Illuminate\Http\Request;
+use Illuminate\Routing\Controller;
+use Illuminate\Support\Facades\Mail;
+use Illuminate\Support\Facades\Storage;
+use Illuminate\Support\Facades\URL;
+use Modules\LeadMagnet\Mail\MagnetLinkMail;
+use Modules\LeadMagnet\Models\LeadMagnet;
+use Modules\LeadMagnet\Models\MagnetDownload;
+
+/**
+ * 资料磁铁前台控制器：
+ *   GET  /download/{slug}          落地页（多语言标题/描述 + 邮箱表单 + honeypot）
+ *   POST /download/{slug}          留邮箱 → 建 Inquiry + MagnetDownload → 发签名链接邮件
+ *   GET  /download/file/{download} 签名路由（magnet.file，Provider 注册，无语言前缀）→ 流式下载文件
+ */
+class MagnetDownloadController extends Controller
+{
+    public function show(Request $request, string $slug)
+    {
+        // 未启用/不存在的资料一律 404，避免泄露存量 slug
+        $magnet = $this->findActive($slug);
+
+        return view('leadmagnet::download', [
+            'magnet' => $magnet,
+            'noindex' => true, // 下载换邮箱的落地页不让搜索引擎收录
+        ]);
+    }
+
+    public function submit(Request $request, string $slug)
+    {
+        $data = $request->validate([
+            'email' => ['required', 'email', 'max:191'],
+            // honeypot：正常用户看不到也不会填，填写即判定为机器人
+            'website' => ['nullable', 'string', 'max:191'],
+        ]);
+
+        $magnet = $this->findActive($slug);
+
+        $isSpam = filled($data['website'] ?? null);
+        $locale = app()->getLocale();
+
+        // utm_* 白名单透传（与核心询盘 API 口径一致），utm_ 前缀剥掉落库
+        $utm = collect($request->query())
+            ->filter(fn ($value, $key) => str_starts_with($key, 'utm_'))
+            ->mapWithKeys(fn ($value, $key) => [str_replace('utm_', '', $key) => $value])
+            ->only(['source', 'medium', 'campaign', 'term', 'content'])
+            ->all() ?: null;
+
+        // 蜜罐命中：只记 spam 询盘，不发下载记录、不发邮件，但照常回成功提示（不惊动机器人）
+        if ($isSpam) {
+            $this->createInquiry($magnet, $data, $utm, $request, $locale, isSpam: true);
+
+            return $this->redirectToLanding($magnet);
+        }
+
+        // 防刷：16 小时内同邮箱重复提交 → 复用下载记录重发链接，不重复建询盘
+        $download = MagnetDownload::query()
+            ->where('magnet_id', $magnet->id)
+            ->where('email', $data['email'])
+            ->where('created_at', '>', now()->subHours(16))
+            ->first();
+
+        if ($download === null) {
+            $inquiry = $this->createInquiry($magnet, $data, $utm, $request, $locale, isSpam: false);
+
+            // 与核心询盘 API 同契约：派发后飞书/邮件通知、LeadLens 评分才会触发
+            \App\Events\InquiryCreated::dispatch($inquiry);
+
+            $download = MagnetDownload::create([
+                'magnet_id' => $magnet->id,
+                'email' => $data['email'],
+                'locale' => $locale,
+                'ip' => $request->ip(),
+                'utm' => $utm,
+            ]);
+        }
+
+        // 16 小时有效的签名下载链接（路由名 magnet.file，由 Provider 注册一次）
+        $url = URL::temporarySignedRoute('magnet.file', now()->addHours(16), [
+            'download' => $download->id,
+        ]);
+
+        // 发信失败不阻塞流程：下载记录已存在，用户可重试提交触发重发
+        try {
+            Mail::to($data['email'])->send(new MagnetLinkMail($magnet, $url));
+        } catch (\Throwable $e) {
+            \Illuminate\Support\Facades\Log::warning('LeadMagnet: 下载链接邮件发送失败', [
+                'magnet' => $magnet->id,
+                'email' => $data['email'],
+                'e' => $e->getMessage(),
+            ]);
+
+            // 运营端可见（否则买家等不到邮件而运营毫不知情）：通知全部管理员
+            try {
+                \App\Models\User::query()->chunkById(100, function ($admins) use ($magnet, $data): void {
+                    foreach ($admins as $admin) {
+                        \Filament\Notifications\Notification::make()
+                            ->title('资料磁铁：下载邮件发送失败')
+                            ->body("买家 {$data['email']} 申请了「{$magnet->title}」但邮件没发出去——通常是邮箱发送配置问题。请检查发件邮箱设置，或用你自己的邮箱手动发送资料。")
+                            ->danger()
+                            ->sendToDatabase($admin);
+                    }
+                });
+            } catch (\Throwable) {
+            }
+        }
+
+        return $this->redirectToLanding($magnet);
+    }
+
+    /**
+     * 询盘落库（source=magnet，蜜罐命中记 spam）。
+     */
+    private function createInquiry(LeadMagnet $magnet, array $data, ?array $utm, Request $request, string $locale, bool $isSpam): Inquiry
+    {
+        return Inquiry::create([
+            'name' => (string) strstr($data['email'], '@', true) ?: $data['email'],
+            'email' => $data['email'],
+            'message' => 'LeadMagnet: '.(string) $magnet->title,
+            'status' => $isSpam ? Inquiry::STATUS_SPAM : Inquiry::STATUS_NEW,
+            'spam_score' => $isSpam ? 100 : 0,
+            'source' => 'magnet',
+            'utm' => $utm,
+            'landing_url' => url()->current(),
+            'ip' => $request->ip(),
+            'user_agent' => mb_substr((string) $request->userAgent(), 0, 500),
+        ]);
+    }
+
+    /**
+     * 签名下载（GET /download/file/{download}，signed 中间件已在路由层校验签名）。
+     */
+    public function download(MagnetDownload $download)
+    {
+        $magnet = $download->magnet;
+        $disk = Storage::disk('local');
+
+        // 链接有效但文件已被后台删除/移走：404 而不是 500
+        abort_unless($magnet && $disk->exists($magnet->file_path), 404);
+
+        // 冗余计数：实际交付文件时 +1
+        $magnet->increment('downloads_count');
+
+        // 下载文件名用 slug + 原扩展（存储名是哈希串，对买家不友好）
+        return $disk->download(
+            $magnet->file_path,
+            $magnet->slug.'.'.pathinfo($magnet->file_path, PATHINFO_EXTENSION),
+        );
+    }
+
+    private function findActive(string $slug): LeadMagnet
+    {
+        return LeadMagnet::query()->where('slug', $slug)->where('active', true)->firstOrFail();
+    }
+
+    private function redirectToLanding(LeadMagnet $magnet)
+    {
+        // 回当前语言的落地页并 flash 成功提示（localized_route 自动按当前语言补前缀）
+        return redirect(localized_route('magnet.show', ['slug' => $magnet->slug]))
+            ->with('magnet_success', __('front.success'));
+    }
+}
